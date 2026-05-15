@@ -18,6 +18,20 @@ use xml::EmitterConfig;
 
 const USER_AGENT: &str = "rr-to-epub <https://github.com/isaac-mcfadyen/rr-to-epub>";
 
+/// Royal Road injects anti-piracy messages into chapter content as
+/// `<span class="HASH">...</span>` where HASH is a 30+ character random
+/// alphanumeric string. The hash is regenerated per message so we match by
+/// the class-name shape rather than its literal value.
+///
+/// Returns the input with all such spans removed.
+pub fn strip_piracy_messages(html: &str) -> String {
+    // Match <span class="ALNUM_30+">...</span>. Class must be alphanumeric
+    // only (no spaces, no dashes) — legitimate spans either have no class or
+    // a short human-readable class.
+    let re = Regex::new(r#"(?s)<span class="[a-zA-Z0-9]{30,}">.*?</span>"#).unwrap();
+    re.replace_all(html, "").to_string()
+}
+
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct Book {
     pub id: u32,
@@ -260,19 +274,40 @@ pub struct Chapter {
     pub authors_note_end: Option<String>,
 }
 
+/// Pick the output path for a generated EPUB.
+///
+/// If the user supplied a path that resolves to an existing directory (or has
+/// a trailing path separator), the default filename is appended to it. If no
+/// path was supplied, the default filename is returned as a bare relative
+/// path. Otherwise the user's path is used verbatim.
+fn resolve_output_path(outfile: Option<&str>, default_filename: &str) -> String {
+    match outfile {
+        Some(path) => {
+            let p = std::path::Path::new(path);
+            let looks_like_dir =
+                p.is_dir() || path.ends_with('/') || path.ends_with(std::path::MAIN_SEPARATOR);
+            if looks_like_dir {
+                p.join(default_filename).to_string_lossy().into_owned()
+            } else {
+                path.to_string()
+            }
+        }
+        None => default_filename.to_string(),
+    }
+}
+
 pub async fn write_epub(book: &Book, outfile: Option<String>) -> eyre::Result<()> {
     // Create a temp dir.
     let temp_folder = tempfile::tempdir()?;
 
-    // Choose the filename.
-    let outfile = match outfile {
-        Some(outfile) => outfile,
-        None => format!(
-            "{}.epub",
-            book.title
-                .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "-")
-        ),
-    };
+    // Default filename derived from the book title, sanitized.
+    let default_filename = format!(
+        "{}.epub",
+        book.title
+            .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "-")
+    );
+
+    let outfile = resolve_output_path(outfile.as_deref(), &default_filename);
 
     // Open the file.
     let epub_path = temp_folder
@@ -474,6 +509,9 @@ fn chapter_html(chapter: &Chapter, file: &mut impl Write) -> eyre::Result<()> {
         // Remove overflow: auto.
         let overflow_regex = Regex::new(r#"overflow:\s?auto"#).unwrap();
         content = overflow_regex.replace_all(&content, "").to_string();
+
+        // Strip Royal Road anti-piracy spans injected into chapter content.
+        content = strip_piracy_messages(&content);
 
         write_elements(
             &mut xml,
@@ -943,4 +981,114 @@ async fn download_image(book: &Book, url: String, file: &mut impl Write) -> eyre
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_output_path, strip_piracy_messages};
+
+    // Real samples extracted from a Royal Road EPUB. Each is wrapped exactly
+    // the way Royal Road injects them — a hash-classed <span> containing
+    // <br>text<br>.
+    const PIRACY_SAMPLES: &[&str] = &[
+        r#"<span class="cmMxOGViZDM1ZmMxZDQyMjFhYWExZmYyNjMxZTY5OTU0"><br>You could be reading stolen content. Head to Royal Road for the genuine story.<br></span>"#,
+        r#"<span class="cmMxNGY3ZDk1N2NmYTRhZDFiMjJiZGI1NzFjMzZhN2My"><br>The story has been stolen; if detected on Amazon, report the violation.<br></span>"#,
+        r#"<span class="cjIzMTViZjM1ZGY5NTRmNmI4YzYxYzNmZTI5NDg0NzE1"><br>The tale has been stolen; if detected on Amazon, report the violation.<br></span>"#,
+        r#"<span class="cjc5NjBlNjY4NDRjNTRmZTliNzc5ZTRjMjdlMGM2NTJi"><br>This tale has been unlawfully lifted from Royal Road; report any instances of this story if found elsewhere.<br></span>"#,
+        r#"<span class="cjA1MTIwNDQzYzJjMzRjYjU5YTJjYWNjNjJkNDhhZjE5"><br>Support creative writers by reading their stories on Royal Road, not stolen versions.<br></span>"#,
+    ];
+
+    #[test]
+    fn strips_real_piracy_spans() {
+        for sample in PIRACY_SAMPLES {
+            let wrapped = format!("<p>before</p>{}<p>after</p>", sample);
+            let cleaned = strip_piracy_messages(&wrapped);
+            assert_eq!(
+                cleaned, "<p>before</p><p>after</p>",
+                "failed to strip sample: {sample}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_legitimate_spans() {
+        // No class — keep.
+        let html = "<p>hello <span>world</span></p>";
+        assert_eq!(strip_piracy_messages(html), html);
+
+        // Short, human-readable class — keep.
+        let html = r#"<p>hello <span class="emphasis">world</span></p>"#;
+        assert_eq!(strip_piracy_messages(html), html);
+
+        // Class with a dash/space — keep (piracy classes are pure alnum).
+        let html = r#"<p><span class="text-bold italic-thing">x</span></p>"#;
+        assert_eq!(strip_piracy_messages(html), html);
+
+        // 29 alnum chars — under threshold, keep.
+        let html = r#"<p><span class="abcdefghijklmnopqrstuvwxyz123">x</span></p>"#;
+        assert_eq!(strip_piracy_messages(html), html);
+    }
+
+    #[test]
+    fn strips_multiple_in_one_input() {
+        let input = format!(
+            "<p>chapter start</p>{}<p>middle</p>{}<p>end</p>",
+            PIRACY_SAMPLES[0], PIRACY_SAMPLES[1]
+        );
+        let cleaned = strip_piracy_messages(&input);
+        assert_eq!(cleaned, "<p>chapter start</p><p>middle</p><p>end</p>");
+    }
+
+    #[test]
+    fn strips_spans_containing_other_tags() {
+        // Defensive: even if RR ever wraps non-text inside the span, the
+        // (?s) flag and lazy quantifier should still match correctly.
+        let input = r#"<p>x</p><span class="cjA0YmE0MjhkYzM2MTRmOWJhODM2ZDcyMGQ5N2Q4MGVh"><br>text with <em>emphasis</em><br></span><p>y</p>"#;
+        let cleaned = strip_piracy_messages(input);
+        assert_eq!(cleaned, "<p>x</p><p>y</p>");
+    }
+
+    #[test]
+    fn no_op_on_clean_input() {
+        let html = "<p>Just some regular chapter content.</p>";
+        assert_eq!(strip_piracy_messages(html), html);
+    }
+
+    #[test]
+    fn output_path_defaults_to_book_title_when_none() {
+        let resolved = resolve_output_path(None, "My Book.epub");
+        assert_eq!(resolved, "My Book.epub");
+    }
+
+    #[test]
+    fn output_path_uses_explicit_file_verbatim() {
+        let resolved = resolve_output_path(Some("custom.epub"), "My Book.epub");
+        assert_eq!(resolved, "custom.epub");
+
+        // A non-existent path with no trailing separator is treated as a
+        // filename, not a directory.
+        let resolved = resolve_output_path(Some("nonexistent/file.epub"), "My Book.epub");
+        assert_eq!(resolved, "nonexistent/file.epub");
+    }
+
+    #[test]
+    fn output_path_appends_default_when_trailing_separator() {
+        let resolved = resolve_output_path(Some("books/"), "My Book.epub");
+        assert_eq!(resolved, "books/My Book.epub");
+    }
+
+    #[test]
+    fn output_path_appends_default_when_existing_directory() {
+        // tempdir gives us a real directory on disk so the is_dir() branch is
+        // exercised — separator-suffix detection alone isn't enough.
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_string_lossy().into_owned();
+        let resolved = resolve_output_path(Some(&dir_path), "My Book.epub");
+        let expected = dir
+            .path()
+            .join("My Book.epub")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(resolved, expected);
+    }
 }
